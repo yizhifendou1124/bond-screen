@@ -1,0 +1,20 @@
+{
+  "target_code": "400030",
+  "mode": "market",
+  "reference_codes": [],
+  "exclude_codes": [],
+  "min_fund_assets_cny": "100000000",
+  "annual_anomaly_gap_pp": "15.00",
+  "target_ytd_gap_pp": "2.00",
+  "earliest_screen_year": 2020,
+  "history_fill_enabled": true,
+  "history_fill_groups": [
+    {
+      "codes": ["015736", "003102"],
+      "preferred_codes": ["003102"],
+      "sources": ["https://fund.eastmoney.com/gonggao/003102,AN202512121798755573.html"]
+    }
+  ],
+  "secondary_watch_codes": [],
+  "hard_years": [2020, 2021, 2022, 2023, 2024, 2025]
+}

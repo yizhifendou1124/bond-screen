@@ -1,0 +1,13 @@
+.venv/
+.bond-screen-venv/
+__pycache__/
+*.py[cod]
+.env
+.env.*
+!.env.example
+*.log
+bond-screen-results/
+results/
+.cache/
+.pytest_cache/
+.DS_Store
