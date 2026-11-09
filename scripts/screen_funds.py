@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import re
 import sys
@@ -109,13 +110,13 @@ def comparable_history(fund):
     return fund["history_basis"] in ("share_class", "same_fund_completed")
 
 
-def negative_annual_returns(fund, years):
+def nonpositive_annual_returns(fund, years):
     if not comparable_history(fund):
         return {}
     return {
         str(year): str(fund["annual_returns"][year])
         for year in years
-        if fund["annual_returns"].get(year) is not None and fund["annual_returns"][year] < 0
+        if fund["annual_returns"].get(year) is not None and fund["annual_returns"][year] <= 0
     }
 
 
@@ -347,6 +348,7 @@ def normalize_fund(raw, as_of):
         "pure_bond": purity,
         "pure_bond_basis": purity_basis,
         "pure_bond_review": purity_review,
+        "disclosure_notes": copy.deepcopy(raw.get("disclosure_notes", [])),
         "history_basis": basis,
         "annual_returns": annual_returns,
         "ytd": percentage(raw["ytd"], f"{code}/ytd"),
@@ -449,7 +451,76 @@ def complete_same_fund_data(funds, groups, enabled, required_years):
                         recipient["data_completion"][field] = provenance
 
 
-def screen(data, target_override=None, mode_override=None):
+def return_conflict_bounds(candidate, raw, earliest_year):
+    bounds = {year: (value, value) for year, value in candidate["annual_returns"].items() if value is not None and year >= earliest_year}
+    updates = {}
+    for year in bounds:
+        source_code = candidate["data_completion"].get("annual_returns", {}).get(str(year), {}).get("source_code", candidate["code"])
+        conflicts = raw[source_code].get("annual_return_conflicts", {})
+        if str(year) not in conflicts:
+            continue
+        values = [percentage(value, f"{source_code}/{year}/conflict") for value in conflicts[str(year)]]
+        if len(values) < 2 or any(value is None or value < -100 for value in values) or candidate["annual_returns"][year] not in values:
+            raise ValueError("收益冲突必须包含实际收益及至少两个有效来源值")
+        bounds[year] = (min(values), max(values))
+        updates.setdefault(source_code, {})[str(year)] = bounds[year]
+    return bounds, updates
+
+
+def check_return_disclosures(data, funds, results, earliest_year, anomaly_gap, target_override, mode_override, history_fill_groups):
+    raw = {fund["code"]: fund for fund in data["funds"]}
+    for result in results:
+        if result["status"] != "qualified":
+            continue
+        bounds, updates = return_conflict_bounds(funds[result["code"]], raw, earliest_year)
+        family_bounds = [bounds]
+        for group in history_fill_groups:
+            if result["code"] not in group["codes"]:
+                continue
+            for code in group["codes"]:
+                if code not in funds or code == result["code"]:
+                    continue
+                member_bounds, member_updates = return_conflict_bounds(funds[code], raw, earliest_year)
+                family_bounds.append(member_bounds)
+                for source_code, years in member_updates.items():
+                    updates.setdefault(source_code, {}).update(years)
+        if not updates:
+            continue
+        sensitive = any(lower <= 0 for lower, upper in bounds.values())
+        for member_bounds in family_bounds:
+            for year, (lower, upper) in member_bounds.items():
+                other_lower = [other[0] for other_year, other in member_bounds.items() if other_year != year]
+                if not other_lower or upper * len(other_lower) - sum(other_lower) >= anomaly_gap * len(other_lower):
+                    sensitive = True
+        probes = []
+        if not sensitive:
+            for index in (0, 1):
+                probe_data = copy.deepcopy(data)
+                for fund in probe_data["funds"]:
+                    for year, values in updates.get(fund["code"], {}).items():
+                        fund["annual_returns"][year] = str(values[index])
+                probe = screen(probe_data, target_override, mode_override, check_conflicts=False)
+                probes.append(next(item for item in probe["results"] if item["code"] == result["code"]))
+            sensitive = any(probe["status"] != "qualified" for probe in probes)
+        result["return_source_sensitivity"] = {"decision_stable": not sensitive, "method": "candidate_lower_upper_bounds_and_worst_case_annual_anomaly", "bounds_pct": {str(year): [str(value) for value in values] for year, values in bounds.items()}, "probe_reasons": [probe["reason"] for probe in probes]}
+        result["return_source_sensitivity"]["classification_stable"] = len({probe["reason"] for probe in probes}) == 1 if not sensitive else None
+        if not sensitive and not result["return_source_sensitivity"]["classification_stable"]:
+            result["disclosure_notes"].append({"kind": "source_conflict_classification", "message": "来源差异不改变入选资格，但可能改变三五年分类；当前按展示的平台收益分类。"})
+        for source_code, years in updates.items():
+            if source_code == result["code"]:
+                for year, values in years.items():
+                    if not any(note.get("kind") == "annual_quote_conflict" and str(note.get("year")) == year for note in result["disclosure_notes"]):
+                        result["disclosure_notes"].append({"kind": "annual_quote_conflict", "year": year, "message": f"{year}年收益来源区间为{values[0]}%至{values[1]}%，保留原值及来源差异，不认定为异常事件。"})
+            else:
+                inherited = any(source.get("source_code") == source_code for source in funds[result["code"]]["data_completion"].get("annual_returns", {}).values())
+                result["disclosure_notes"].append({"kind": "inherited_annual_quote_conflict" if inherited else "same_fund_annual_quote_conflict", "source_code": source_code, "years": sorted(years), "message": "同基金其他份额或补全来源存在年度收益差异，整基金异常限制及补全值均已纳入校核，不隐去来源疑点。"})
+        if sensitive:
+            result.update(status="observation", reason="RETURN_SOURCE_CONFLICT_DECISION_SENSITIVE", missing=["RETURN_SOURCE_CONFLICT_DECISION_SENSITIVE"], retained_with_notes=False)
+        else:
+            result["retained_with_notes"] = True
+
+
+def screen(data, target_override=None, mode_override=None, check_conflicts=True):
     defaults_path = Path(__file__).resolve().parent.parent / "references" / "defaults.json"
     with defaults_path.open(encoding="utf-8") as handle:
         defaults = json.load(handle)
@@ -498,8 +569,8 @@ def screen(data, target_override=None, mode_override=None):
     history_fill_enabled = data.get("history_fill_enabled", defaults.get("history_fill_enabled", True))
     history_fill_groups = data.get("history_fill_groups", defaults.get("history_fill_groups", []))
     acquired_years = sorted({year for fund in funds.values() for year in fund["annual_returns"] if year >= earliest_year})
-    nonnegative_years = list(range(earliest_year, cutoff.year))
-    complete_same_fund_data(funds, history_fill_groups, history_fill_enabled, hard_years + three_years + five_years + acquired_years + nonnegative_years)
+    positive_years = list(range(earliest_year, cutoff.year))
+    complete_same_fund_data(funds, history_fill_groups, history_fill_enabled, hard_years + three_years + five_years + acquired_years + positive_years)
     quantitative_reviews = {code: quantitative_annual_anomalies(fund, anomaly_gap, earliest_year) for code, fund in funds.items()}
     anomaly_reviews = review_annual_anomalies(funds, history_fill_groups, hard_years + three_years + five_years, quantitative_reviews, earliest_year)
     reference_codes = code_list(data.get("reference_codes", defaults.get("reference_codes", [])), "reference_codes")
@@ -519,6 +590,9 @@ def screen(data, target_override=None, mode_override=None):
     target_three = annualized(target, three_years)
     target_five = annualized(target, five_years)
     target_missing = []
+    raw = {fund["code"]: fund for fund in data["funds"]}
+    if return_conflict_bounds(target, raw, earliest_year)[1]:
+        target_missing.append("TARGET_RETURN_SOURCE_CONFLICT_UNCONFIRMED")
     if anomaly_reviews[target_code]["status"] != "clear":
         target_missing.append(
             "TARGET_ANNUAL_ANOMALY_CONFIRMED" if anomaly_reviews[target_code]["status"] == "confirmed"
@@ -533,6 +607,7 @@ def screen(data, target_override=None, mode_override=None):
     reference_missing = [code for code in reference_codes if not complete_history(funds[code], hard_years)]
     reference_ytd_missing = [code for code in reference_codes if funds[code]["ytd"] is None]
     reference_anomaly_missing = [code for code in reference_codes if anomaly_reviews[code]["status"] != "clear"]
+    reference_conflict_missing = [code for code in reference_codes if return_conflict_bounds(funds[code], raw, earliest_year)[1]]
     floor = target["ytd"] - Decimal("0.30") if target["ytd"] is not None else None
     results = []
     for code, candidate in funds.items():
@@ -558,6 +633,8 @@ def screen(data, target_override=None, mode_override=None):
             "sources": candidate["sources"],
             "pure_bond_basis": candidate["pure_bond_basis"],
             "pure_bond_review": candidate["pure_bond_review"],
+            "disclosure_notes": candidate["disclosure_notes"],
+            "retained_with_notes": False,
             "pure_bond_eligible": purity_eligible,
             "pure_bond_missing": purity_missing,
             "history_basis": candidate["history_basis"],
@@ -565,7 +642,7 @@ def screen(data, target_override=None, mode_override=None):
             "annual_anomaly_review": candidate["annual_anomaly_review"],
             "annual_anomaly_eligibility": anomaly_reviews[code],
             "quantitative_annual_anomaly_test": quantitative_reviews[code],
-            "negative_annual_returns_pct": negative_annual_returns(candidate, nonnegative_years),
+            "nonpositive_annual_returns_pct": nonpositive_annual_returns(candidate, positive_years),
             "fund_assets_cny": None if candidate["fund_assets_cny"] is None else str(candidate["fund_assets_cny"]),
             "fund_assets_basis": candidate["fund_assets_basis"],
             "fund_assets_date": candidate["fund_assets_date"],
@@ -593,12 +670,12 @@ def screen(data, target_override=None, mode_override=None):
         if anomaly_reviews[code]["status"] == "confirmed":
             result.update(status="excluded", reason="ABNORMAL_ANNUAL_RETURN")
             continue
-        if result["negative_annual_returns_pct"]:
+        if result["nonpositive_annual_returns_pct"]:
             result["witnesses"].append({
-                "rule": "R4", "negative_annual_returns_pct": result["negative_annual_returns_pct"],
+                "rule": "R4", "nonpositive_annual_returns_pct": result["nonpositive_annual_returns_pct"],
                 "sources": candidate["sources"], "data_completion": candidate["data_completion"],
             })
-            result.update(status="excluded", reason="NEGATIVE_ANNUAL_RETURN")
+            result.update(status="excluded", reason="NONPOSITIVE_ANNUAL_RETURN")
             continue
         if subscription_eligible is False:
             result.update(status="excluded", reason="CURRENTLY_NOT_SUBSCRIBABLE")
@@ -619,6 +696,8 @@ def screen(data, target_override=None, mode_override=None):
                     "ytd_gap_pp": str(gap), "threshold_pp": str(target_ytd_gap),
                 })
         for reference_code in reference_codes:
+            if reference_code in reference_conflict_missing:
+                continue
             if reference_code == code:
                 continue
             if (
@@ -665,8 +744,8 @@ def screen(data, target_override=None, mode_override=None):
             missing.append("PROXY_NOT_OWN_HISTORY")
         if not complete_history(candidate, hard_years):
             missing.append("HARD_YEAR_HISTORY_INCOMPLETE")
-        if not complete_history(candidate, nonnegative_years):
-            missing.append("NONNEGATIVE_ANNUAL_HISTORY_INCOMPLETE")
+        if not complete_history(candidate, positive_years):
+            missing.append("POSITIVE_ANNUAL_HISTORY_INCOMPLETE")
         if three is None or five is None:
             missing.append("LONG_TERM_HISTORY_INCOMPLETE")
         if candidate["ytd"] is None:
@@ -685,6 +764,11 @@ def screen(data, target_override=None, mode_override=None):
             result.update(status="qualified", reason="BOTH_HORIZONS_AT_LEAST_TARGET")
         else:
             result.update(status="qualified", reason="ONE_HORIZON_AT_LEAST_TARGET")
+    if check_conflicts:
+        check_return_disclosures(data, funds, results, earliest_year, anomaly_gap, target_override, mode_override, history_fill_groups)
+    for result in results:
+        if result["status"] == "qualified" and result["disclosure_notes"]:
+            result["retained_with_notes"] = True
     qualified = sorted(
         [result for result in results if result["status"] == "qualified"],
         key=lambda result: qualified_sort_key({**result, "ytd": funds[result["code"]]["ytd"]}),
@@ -704,10 +788,11 @@ def screen(data, target_override=None, mode_override=None):
         "exclude_codes": exclude_codes, "target_data_unavailable": target_missing,
         "calendar_3y": three_years, "calendar_5y": five_years,
         "hard_years": hard_years, "reference_codes": reference_codes,
-        "nonnegative_annual_years": nonnegative_years,
+        "positive_annual_years": positive_years,
         "reference_history_unavailable": reference_missing,
         "reference_ytd_unavailable": reference_ytd_missing,
         "reference_anomaly_unavailable": reference_anomaly_missing,
+        "reference_return_conflict_unavailable": reference_conflict_missing,
         "history_fill_enabled": history_fill_enabled,
         "same_fund_data_completion": {
             code: fund["data_completion"] for code, fund in funds.items() if fund["data_completion"]
